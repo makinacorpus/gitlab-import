@@ -4,7 +4,9 @@ from __future__ import (absolute_import, division,
                         print_function, unicode_literals)
 __docformat__ = 'restructuredtext en'
 
+import re
 import requests
+import time
 from optparse import OptionParser
 import json
 import os
@@ -18,6 +20,13 @@ import unicodedata
 
 
 logger = logging.getLogger('gitlab_import')
+PUSH_CMD = (
+    'set -x && cd {0}/{1}/{2}'
+    ' && '
+    'if [ "x$(git count-objects|awk \'{{print $1}}\')" != "x0" ];then'
+    '  git push --force --mirror {3};'
+    'fi'
+)
 
 
 class UserCreationError(Exception):
@@ -36,8 +45,12 @@ class GroupCreationError(Exception):
     '''.'''
 
 
+class PushError(Exception):
+    '''.'''
+
+
 parser = OptionParser()
-parser.add_option("-d", "--dir", dest="dir",
+parser.add_option("-d", "--directory", dest="directory",
                   default="/srv/projects/gitlab/data/gitorious",
                   help="Gitlab import directory")
 parser.add_option("-u", "--users",
@@ -46,9 +59,15 @@ parser.add_option("-u", "--users",
 parser.add_option("--do-not-update-group-members",
                   action="store_false", dest="update_group_members",
                   default=True)
+parser.add_option("--do-not-update-repositories",
+                  action="store_false", dest="update_repositories",
+                  default=True)
 parser.add_option("--do-not-update-group-readers",
                   action="store_false", dest="update_group_readers",
                   default=True)
+parser.add_option("--push-repositories",
+                  action="store_true", dest="push_repositories",
+                  default=False)
 parser.add_option("-s", "--sshkeys",
                   action="store_true", dest="sshkeys", default=False,
                   help="Import sshkeys")
@@ -197,6 +216,9 @@ def import_users(gl, users):
 
 def import_projects(gl,
                     projects,
+                    directory,
+                    update_repositories=True,
+                    push_repositories=False,
                     update_group_members=True,
                     update_group_readers=True):
     '''
@@ -233,7 +255,7 @@ def import_projects(gl,
     '''
     done = []
     for project in projects:
-        gdone = {'group': None, 'perms': {}}
+        gdone = {'group': None, 'perms': {}, "repos": {}, "pushed": {}}
         slug = project['slug'].replace('_', '-')
         slug = project['slug']
         groups = [a for a in getgroups(gl, per_page=1000000)
@@ -258,51 +280,7 @@ def import_projects(gl,
                 if ix == 0 or (ix > 0 and changed):
                     members = getgroupmembers(gl, group['id'])
                 changed = False
-
-                gprojects = getprojectsingroup(gl, group['name'])
-                gproject = None
-                if gprojects and isinstance(gprojects, list):
-                    gprojects = [a for a in gprojects
-                                 if a['name'] == repo['name']]
-                    if gprojects:
-                        gproject = gprojects[0]
-                        logger.info('Already existing repo {0}'.format(
-                            repo['name']))
-                if not gproject:
-                    logger.info('Creating {0}'.format(repo['name']))
-                    gproject = gl.createproject(
-                        repo['name'],
-                        namespace_id=group['id'],
-                        description=repo['description'])
-                readers = repo['readers']
-                if not update_group_members:
-                    readers = []
-                for reader in readers:
-                    if (
-                        reader in gdone['perms']
-                        or reader in [a['username'] for a in members]
-                    ):
-                        logger.info(
-                            'PERM: {0}/{1} -> master '
-                            'already done'.format(group['name'], reader))
-                        continue
-                    login, user = get_user(gl, reader)
-                    if user:
-                        if (
-                            login in gdone['perms']
-                            or login in [a['username'] for a in members]
-                        ):
-                            logger.info(
-                                'PERM: {0}/{1} -> master '
-                                'already done'.format(group['name'],
-                                                      user['username']))
-                            continue
-                        logger.info(
-                            'PERM: {0}/{1} -> master'.format(group['name'],
-                                                             user['username']))
-                        gl.addgroupmember(group['id'], user['id'], "reporter")
-                        gdone['perms'][user['id']] = 'reporter'
-                        changed = True
+                #
                 commiters = repo['commiters']
                 if not update_group_members:
                     commiters = []
@@ -332,15 +310,89 @@ def import_projects(gl,
                         gl.addgroupmember(group['id'], user['id'], "master")
                         gdone['perms'][user['id']] = 'master'
                         changed = True
+                #
+                readers = repo['readers']
+                if not update_group_members:
+                    readers = []
+                for reader in readers:
+                    if (
+                        reader in gdone['perms']
+                        or reader in [a['username'] for a in members]
+                    ):
+                        logger.info(
+                            'PERM: {0}/{1} -> master '
+                            'already done'.format(group['name'], reader))
+                        continue
+                    login, user = get_user(gl, reader)
+                    if user:
+                        if (
+                            login in gdone['perms']
+                            or login in [a['username'] for a in members]
+                        ):
+                            logger.info(
+                                'PERM: {0}/{1} -> master '
+                                'already done'.format(group['name'],
+                                                      user['username']))
+                            continue
+                        logger.info(
+                            'PERM: {0}/{1} -> master'.format(group['name'],
+                                                             user['username']))
+                        gl.addgroupmember(group['id'], user['id'], "reporter")
+                        gdone['perms'][user['id']] = 'reporter'
+                        changed = True
+                #
+                if update_repositories or push_repositories:
+                    gproject = gdone['repos'].get(repo['name'])
+                    if not gproject:
+                        gproject = getproject(
+                            gl, repo['name'], group=group['name'])
+                        if gproject:
+                            logger.info('Already existing repo {0}'.format(
+                                repo['name']))
+                    else:
+                        logger.info('Already done repo {0}'.format(
+                            repo['name']))
+                    if not gproject:
+                        logger.info('Creating {0}'.format(repo['name']))
+                        gproject = gl.createproject(
+                            repo['name'],
+                            namespace_id=group['id'],
+                            description=repo['description'])
+                    if gproject:
+                        gdone['repos'][repo['name']] = gproject
+                    if (
+                        push_repositories
+                        and repo['name'] not in gdone['pushed']
+                    ):
+                        cmd = PUSH_CMD.format(directory,
+                                              project['slug'],
+                                              repo['name'],
+                                              gproject['ssh_url_to_repo'])
+                        logger.info('Pushing {0}/{1} ({2})'.format(
+                            group['path'], repo['name'], cmd))
+                        ret = os.system(cmd)
+                        if ret:
+                            raise PushError('{0} failed'.format(cmd))
+                        gdone['pushed'][repo['name']] = gproject
         done.append(group)
     return done
 
 
-def getprojectsingroup(self, group=None, page=1, per_page=100):
+def get_lk_part(lk, part='next'):
+    matching = re.compile('<(?P<m>[^>]+)>; rel="{0}"'.format(part))
+    match = matching.search(lk)
+    if match:
+        lk = match.groupdict()['m']
+    return lk
+
+
+def _getprojectsingroup(self, group=None, page=1, per_page=100):
     """Returns a dictionary of all the projects for admins only
     (patch original version to support pagination)
 
-    :return: list with the repo name, description, last activity,web url, ssh url, owner and if its public
+    :return: list with the repo name,
+             description, last activity,web url,
+             ssh url, owner and if its public
     """
     data = {'page': page, 'per_page': per_page}
 
@@ -353,7 +405,7 @@ def getprojectsingroup(self, group=None, page=1, per_page=100):
             try:
                 lk = request.headers['link']
                 if 'next' in lk:
-                    url = lk.split('<')[1].split('>;')[0]
+                    url = get_lk_part(lk)
                     request = requests.get(url,
                                            headers=self.headers,
                                            verify=self.verify_ssl)
@@ -369,9 +421,33 @@ def getprojectsingroup(self, group=None, page=1, per_page=100):
         if group:
             projects = [p for p in projects
                         if p['namespace']['name'] == group]
+
         return projects
     else:
         return False
+
+
+def getprojectsingroup(self, group=None, page=1, per_page=100):
+    projects = None
+    for i in range(10):
+        if not projects:
+            projects = _getprojectsingroup(
+                self, group=group, page=page, per_page=per_page)
+        if not projects:
+            logger.debug('Retrying projects call (empty)')
+            time.sleep(0.05)
+        else:
+            break
+    return projects
+
+
+def getproject(self, project, group=None, page=1, per_page=100):
+    gproject, projects = None, None
+    groupprojects = getprojectsingroup(self, group=group)
+    projects = [a for a in groupprojects if a['name'] == project]
+    if projects and isinstance(projects, list):
+        gproject = projects[0]
+    return gproject
 
 
 def getgroupmembers(self, group_id, page=1, per_page=100):
@@ -394,13 +470,14 @@ def getgroupmembers(self, group_id, page=1, per_page=100):
             try:
                 lk = request.headers['link']
                 if 'next' in lk:
-                    url = lk.split('<')[1].split('>;')[0]
+                    url = get_lk_part(lk)
                     request = requests.get(url,
                                            headers=self.headers,
                                            verify=self.verify_ssl)
                     if request.status_code == 200:
                         members.extend(
                             json.loads(request.content.decode("utf-8")))
+                        cont = False
                     else:
                         return False
                 else:
@@ -432,13 +509,14 @@ def getgroups(self, group_id=None, page=1, per_page=20):
             try:
                 lk = request.headers['link']
                 if 'next' in lk:
-                    url = lk.split('<')[1].split('>;')[0]
+                    url = get_lk_part(lk)
                     request = requests.get(url,
                                            headers=self.headers,
                                            verify=self.verify_ssl)
                     if request.status_code == 200:
                         groups.extend(
                             json.loads(request.content.decode("utf-8")))
+                        cont = False
                     else:
                         return False
                 else:
@@ -458,7 +536,6 @@ def main():
     logging.getLogger("requests").setLevel(
         logging.getLevelName(options.rloglevel.upper()))
     todo = (options.users
-            or options.gprojects
             or options.projects
             or options.sshkeys)
     if not todo:
@@ -467,18 +544,19 @@ def main():
     jusers = None
     gl = get_gitlab(options.api, options.token)
     users, sshkeys, projects, gprojects = None, None, None, None
-    with open(os.path.join(options.dir, "export.json")) as fic:
+    with open(os.path.join(options.directory, "export.json")) as fic:
         jproj = json.loads(fic.read())
-    with open(os.path.join(options.dir, "users.json")) as fic:
+    with open(os.path.join(options.directory, "users.json")) as fic:
         jusers = json.loads(fic.read())
     if options.projects:
         projects = import_projects(
             gl,
             jproj,
+            directory=options.directory,
+            push_repositories=options.push_repositories,
+            update_repositories=options.update_repositories,
             update_group_readers=options.update_group_readers,
             update_group_members=options.update_group_members)
-    if options.gprojects:
-        gprojects = import_gprojects(gl, jproj, options.directory)
     if options.users:
         users = import_users(gl, jusers)
     if options.sshkeys:

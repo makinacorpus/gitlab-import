@@ -173,12 +173,18 @@ def getusers(self, search=None, page=1, per_page=20):
         return False
 
 
+_groups = {}
+def cachedgroups(gl, key='g'):
+    if _groups.get(key) is None:
+        _groups[key] = getgroups(gl, per_page=1000000)
+    return _groups[key]
+
+
 def get_user(gl, login):
     '''
     Avoid shadowing a group namespace with a user login
     '''
-    groups = [a for a in getgroups(gl, per_page=1000000)
-              if a['path'] == login]
+    groups = [a for a in cachedgroups(gl) if a['path'] == login]
     if groups:
         login = 'u' + login
         logger.info('Renaming user to {0}'.format(login))
@@ -211,7 +217,12 @@ def manage_ssh_keys(gl, keys, fusers=None):
                            or user['email'] in fusers):
             logger.info('Skip {0}'.format(user['username']))
             continue
-        login, guser = get_user(gl, user['username'])
+        try:
+            login, guser = get_user(gl, user['username'])
+        except:
+            logger.info('pb with {0}'.format(pformat(user)))
+            raise
+            continue
         if not guser:
             raise UserDoesNotExists(pformat(user))
         gl.setsudo(guser['id'])
@@ -219,6 +230,8 @@ def manage_ssh_keys(gl, keys, fusers=None):
         if cuser['username'] != login:
             raise UserCantChange('Cant change to {0}'.format(login))
         csshkeys = gl.getsshkeys(per_page=10000)
+        if not csshkeys:
+            csshkeys = []
         for key in csshkeys:
             found = False
             for match in keys:
@@ -229,6 +242,7 @@ def manage_ssh_keys(gl, keys, fusers=None):
             if found:
                 logger.info('Removing {0}'.format(pformat(key)))
                 gl.deletesshkey(key['id'])
+                done[key['id']] = key
         gl.setsudo(None)
         cuser = gl.currentuser()
         if cuser['username'] != ruser['username']:

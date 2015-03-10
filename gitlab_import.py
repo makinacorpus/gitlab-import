@@ -222,7 +222,6 @@ def import_projects(gl,
                     update_group_members=True,
                     update_group_readers=True):
     '''
-    newtech dreal-centre ulamotte
     Register  projects/repos structure
     Wait for a json list in the form::
 
@@ -245,7 +244,7 @@ def import_projects(gl,
                      "bar"
                  ],
                  "description": "",
-                 "clone_url": "git://gitorious.xxx.net/xcg/xxx.git",
+                 "clone_url": "git://gitorious.xxx.net/yyy/xxx.git",
                  "owner_type": "User"
                }
              ]
